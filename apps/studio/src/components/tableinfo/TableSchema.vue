@@ -166,7 +166,10 @@ export default Vue.extend({
       removedRows: [],
       error: null,
       reorderedRows: Array.from(new Set()),
-      initialColumns: []
+      initialColumns: [],
+      // Wall-clock time (ms) the current AUTO_INCREMENT value was loaded, used to show
+      // how fresh the displayed value is in the Extra cell tooltip.
+      autoIncrementLoadedAt: null,
     }
   },
   watch: {
@@ -211,6 +214,17 @@ export default Vue.extend({
     },
     hasEdits() {
       return this.editCount > 0
+    },
+    // Editing the next AUTO_INCREMENT value inline is a MySQL/MariaDB feature. The mysql
+    // dialect also covers TiDB, but TiDB allocates IDs in cached per-node ranges with
+    // different AUTO_INCREMENT semantics (so the clamp/next-value model here doesn't apply);
+    // it's excluded by connectionType. A dialect can also opt out via
+    // disabledFeatures.alter.editAutoIncrement.
+    canEditAutoIncrement() {
+      return this.editable &&
+        this.dialect === 'mysql' &&
+        this.usedConfig?.connectionType !== 'tidb' &&
+        !this.disabledFeatures?.alter?.editAutoIncrement
     },
     tableColumns() {
       const canMoveRows = !this.dialectData.disabledFeatures?.alter?.reorderColumn
@@ -276,12 +290,17 @@ export default Vue.extend({
         (this.disabledFeatures?.informationSchema?.extra ? null : {
           title: "Extra",
           field: 'extra',
-          tooltip: true,
+          tooltip: this.extraCellTooltip.bind(this),
           headerTooltip: 'eg AUTO_INCREMENT',
-          editable: false,
+          // Only the auto-increment column's cell is editable here (its value is the
+          // table's next AUTO_INCREMENT). All other Extra cells stay read-only.
+          editor: vueEditor(NullableInputEditorVue),
+          editable: this.isAutoIncrementCellEditable.bind(this),
+          cellEdited: this.cellEdited,
           cssClass: this.customColumnCssClass('alterColumn'),
-          formatter: this.cellFormatter,
-          minWidth: 90,
+          formatter: this.extraCellFormatter,
+          // A touch wider so the "auto_increment" label + value fit without truncation.
+          minWidth: 150,
         }),
         (this.disabledFeatures?.comments ? null : {
           title: 'Comment',
@@ -321,10 +340,27 @@ export default Vue.extend({
       const keys = _.keyBy(this.primaryKeys, 'columnName')
       return this.table.columns.map((c) => {
         const key = keys[c.columnName]
-        return {
+        // Treat as the editable auto-increment cell only when (a) the dialect supports it,
+        // (b) the current value is actually readable, and (c) EXTRA is exactly
+        // `auto_increment` (anchored — it never co-occurs with other EXTRA flags).
+        const isAutoIncrement = this.canEditAutoIncrement
+          && c.autoIncrement != null
+          && !!c.extra
+          && /^auto_increment$/i.test(String(c.extra).trim())
+        const row = {
           primary: !!key || null,
           ...c
         }
+        if (isAutoIncrement) {
+          // Surface the table's next AUTO_INCREMENT value in the Extra cell so it can be
+          // viewed and edited inline. Keep the original "auto_increment" keyword in
+          // `extraKeyword` so the formatter can label it and the column-reorder DDL still
+          // emits AUTO_INCREMENT correctly.
+          row.autoIncrementColumn = true
+          row.extraKeyword = c.extra
+          row.extra = String(c.autoIncrement)
+        }
+        return row
       })
     },
   },
@@ -366,7 +402,12 @@ export default Vue.extend({
     },
     collectChanges(): AlterTableSpec {
 
-      const alterations = this.editedCells.map((cell: CellComponent) => {
+      // The auto-increment cell lives in the Extra column but is a table-level change,
+      // not a per-column 'extra' alteration. Pull it out before mapping the rest.
+      const autoIncrementCells = this.editedCells.filter((c: CellComponent) => this.isAutoIncrementCell(c))
+      const columnCells = this.editedCells.filter((c: CellComponent) => !this.isAutoIncrementCell(c))
+
+      const alterations = columnCells.map((cell: CellComponent) => {
 
         // renames happen last, so we need to get the original column name here.
         const nameCell = cell.getRow().getCell('columnName')
@@ -386,8 +427,15 @@ export default Vue.extend({
       const drops = this.removedRows.map((row) => row.getData()['columnName'])
 
       const reorder = (this.reorderedRows.length > 0)
-        ? { oldOrder: this.initialColumns.slice(0), newOrder: this.tabulator.getData() }
+        ? { oldOrder: this.initialColumns.slice(0), newOrder: this.sanitizeReorderData(this.tabulator.getData()) }
         : null
+
+      let autoIncrement: number | undefined = undefined
+      if (autoIncrementCells.length > 0) {
+        const raw = autoIncrementCells[0].getValue()
+        const num = raw == null || `${raw}`.trim() === '' ? NaN : Number(raw)
+        if (!Number.isNaN(num)) autoIncrement = Math.trunc(num)
+      }
 
       return {
         table: this.table.name,
@@ -396,7 +444,8 @@ export default Vue.extend({
         alterations,
         adds,
         drops,
-        reorder
+        reorder,
+        autoIncrement
       }
     },
     // submission methods
@@ -405,6 +454,16 @@ export default Vue.extend({
         if (this.usedConfig.readOnlyMode) return;
         this.error = null
         const changes = this.collectChanges()
+
+        // Validate the requested auto-increment value before touching the database.
+        const requestedAutoIncrement = changes.autoIncrement
+        if (requestedAutoIncrement !== undefined) {
+          if (!Number.isInteger(requestedAutoIncrement) || requestedAutoIncrement <= 0) {
+            this.$noty.error('Auto-increment must be a positive whole number.')
+            return
+          }
+        }
+
         await this.connection.alterTable(changes);
 
         this.clearChanges()
@@ -413,6 +472,18 @@ export default Vue.extend({
           this.initializeTabulator()
         })
         this.$noty.success(`${this.table.name} Updated`)
+
+        // MySQL/MariaDB silently clamp AUTO_INCREMENT up to (highest existing value + 1).
+        // Re-read the real value and let the user know when their request was adjusted.
+        if (requestedAutoIncrement !== undefined) {
+          const actual = this.readCurrentAutoIncrement()
+          if (actual != null && actual !== requestedAutoIncrement) {
+            this.$noty.info(
+              `Auto-increment is now ${actual}. ${this.dialect === 'mysql' ? 'MySQL/MariaDB' : 'The database'} ` +
+              `won't set it below the largest existing value, so the requested ${requestedAutoIncrement} was adjusted.`
+            )
+          }
+        }
       } catch(ex) {
         this.error = ex
         console.error(ex)
@@ -512,9 +583,79 @@ export default Vue.extend({
         }
       }
     },
+    // ---- auto-increment helpers ----
+    isAutoIncrementRow(row: RowComponent): boolean {
+      return row?.getData()?.autoIncrementColumn === true
+    },
+    isAutoIncrementCell(cell: CellComponent): boolean {
+      return cell.getField() === 'extra' && this.isAutoIncrementRow(cell.getRow())
+    },
+    // Editable only for the auto-increment column's Extra cell on a supported dialect.
+    // Every other Extra cell stays read-only (matching the previous behaviour).
+    isAutoIncrementCellEditable(cell: CellComponent): boolean {
+      if (!this.canEditAutoIncrement) return false
+      const row = cell.getRow()
+      if (this.removedRows.includes(row)) return false
+      if (this.newRows.includes(row)) return false
+      return this.isAutoIncrementRow(row)
+    },
+    // Restore the original "auto_increment" keyword on the auto-increment column before
+    // the reorder DDL is built, so the regenerated column definition keeps AUTO_INCREMENT
+    // instead of the numeric value we display in the cell.
+    sanitizeReorderData(rows: any[]): any[] {
+      return rows.map((r) => {
+        if (r?.autoIncrementColumn && r.extraKeyword != null) {
+          return { ...r, extra: r.extraKeyword }
+        }
+        return r
+      })
+    },
+    // Read the current next AUTO_INCREMENT value from the freshly loaded columns.
+    readCurrentAutoIncrement(): number | null {
+      const col = (this.table.columns || []).find((c) => !!c.extra && /^auto_increment$/i.test(String(c.extra).trim()))
+      return col && col.autoIncrement != null ? Number(col.autoIncrement) : null
+    },
+    // Keeps the "auto_increment" keyword visible to the left of the value in the display
+    // state, so the cell reads e.g. "auto_increment 1042" without needing a hover. The edit
+    // field still opens with just the raw number. Other Extra cells use the normal formatter.
+    extraCellFormatter(cell: CellComponent, formatterParams: any, onRendered: any): string {
+      if (this.isAutoIncrementRow(cell.getRow())) {
+        const label = escapeHtml(`${cell.getRow().getData().extraKeyword ?? 'auto_increment'}`)
+        const value = escapeHtml(`${cell.getValue() ?? ''}`)
+        return `<span class="auto-increment-label" style="opacity:0.55;margin-right:6px;">${label}</span>${value}`
+      }
+      return this.cellFormatter(cell, formatterParams, onRendered)
+    },
+    extraCellTooltip(_e: any, cell: CellComponent, _onRendered: any): string {
+      if (this.isAutoIncrementRow(cell.getRow())) {
+        const value = escapeHtml(`${cell.getValue() ?? ''}`)
+        const ago = this.autoIncrementLoadedAt
+          ? ` (loaded ${this.formatLoadedAgo(Date.now() - this.autoIncrementLoadedAt)} ago)`
+          : ''
+        return `Next AUTO_INCREMENT value: ${value}${ago}. ` +
+          `The next inserted row uses this value. It can't be set below the largest existing value.`
+      }
+      return escapeHtml(`${cell.getValue() ?? ''}`)
+    },
+    formatLoadedAgo(ms: number): string {
+      let s = Math.max(0, Math.floor(ms / 1000))
+      const d = Math.floor(s / 86400); s -= d * 86400
+      const h = Math.floor(s / 3600); s -= h * 3600
+      const m = Math.floor(s / 60); s -= m * 60
+      const parts = []
+      if (d) parts.push(`${d}d`)
+      if (h) parts.push(`${h}h`)
+      if (m) parts.push(`${m}m`)
+      parts.push(`${s}s`)
+      return parts.join(' ')
+    },
     initializeTabulator() {
       log.info('initializing tabulator, (editable, columns)', this.editable, this.tableColumns)
       const canMoveRows = !this.dialectData.disabledFeatures?.alter?.reorderColumn
+
+      // Mark when the AUTO_INCREMENT value was loaded so the Extra cell tooltip can show
+      // how fresh it is.
+      this.autoIncrementLoadedAt = Date.now()
 
       this.initialColumns = this.tableData.slice(0)
       if (this.tabulator) this.tabulator.destroy()
